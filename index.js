@@ -221,25 +221,98 @@ async function handleStream(response, model) {
   let contentIndex = 0;
   let hasThinkingBlock = false;
   let hasTextBlock = false;
+  let inThinkTag = false;
+  let contentBuffer = '';
   const toolCalls = {};
 
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
 
-  const send = (event, data) => writer.write(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  const send = (event, data) => {
+    writer.write(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  };
+
+  const sendThinking = (text) => {
+    if (!text) return;
+    if (!hasThinkingBlock) {
+      send('content_block_start', { type: 'content_block_start', index: contentIndex, content_block: { type: 'thinking', thinking: '' } });
+      hasThinkingBlock = true;
+    }
+    send('content_block_delta', { type: 'content_block_delta', index: contentIndex, delta: { type: 'thinking_delta', thinking: text } });
+  };
+
+  const sendText = (text) => {
+    if (!text) return;
+    if (hasThinkingBlock && !hasTextBlock) {
+      send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
+      hasThinkingBlock = false;
+    }
+    if (!hasTextBlock) {
+      send('content_block_start', { type: 'content_block_start', index: contentIndex, content_block: { type: 'text', text: '' } });
+      hasTextBlock = true;
+    }
+    send('content_block_delta', { type: 'content_block_delta', index: contentIndex, delta: { type: 'text_delta', text } });
+  };
+
+  const processContent = (text) => {
+    contentBuffer += text;
+
+    while (true) {
+      if (inThinkTag) {
+        const endIdx = contentBuffer.indexOf('</think>');
+        if (endIdx !== -1) {
+          sendThinking(contentBuffer.slice(0, endIdx));
+          contentBuffer = contentBuffer.slice(endIdx + 8);
+          inThinkTag = false;
+        } else if (contentBuffer.length > 8) {
+          sendThinking(contentBuffer.slice(0, -8));
+          contentBuffer = contentBuffer.slice(-8);
+          break;
+        } else {
+          break;
+        }
+      } else {
+        const startIdx = contentBuffer.indexOf('<think>');
+        if (startIdx !== -1) {
+          const before = contentBuffer.slice(0, startIdx);
+          if (before) sendText(before);
+          contentBuffer = contentBuffer.slice(startIdx + 7);
+          inThinkTag = true;
+        } else if (contentBuffer.length > 7) {
+          sendText(contentBuffer.slice(0, -7));
+          contentBuffer = contentBuffer.slice(-7);
+          break;
+        } else {
+          break;
+        }
+      }
+    }
+  };
+
+  const flushBuffer = () => {
+    if (contentBuffer) {
+      if (inThinkTag) {
+        sendThinking(contentBuffer);
+      } else {
+        sendText(contentBuffer);
+      }
+      contentBuffer = '';
+    }
+  };
 
   const closeStream = async (reason = 'end_turn') => {
-    if (hasThinkingBlock) await send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
-    if (hasTextBlock) await send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
+    flushBuffer();
+    if (hasThinkingBlock) send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
+    if (hasTextBlock) send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
     for (const idx of Object.keys(toolCalls)) {
-      await send('content_block_stop', { type: 'content_block_stop', index: contentIndex + parseInt(idx) });
+      send('content_block_stop', { type: 'content_block_stop', index: contentIndex + parseInt(idx) });
     }
-    await send('message_delta', { type: 'message_delta', delta: { stop_reason: reason }, usage: { output_tokens: tokens } });
-    await send('message_stop', { type: 'message_stop' });
+    send('message_delta', { type: 'message_delta', delta: { stop_reason: reason }, usage: { output_tokens: tokens } });
+    send('message_stop', { type: 'message_stop' });
     await writer.close();
   };
 
-  await send('message_start', {
+  send('message_start', {
     type: 'message_start',
     message: { id, type: 'message', role: 'assistant', content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } },
   });
@@ -263,7 +336,7 @@ async function handleStream(response, model) {
           if (!data) continue;
 
           if (data === '[DONE]') {
-            await closeStream(Object.keys(toolCalls).length > 0 ? 'tool_use' : 'end_turn');
+            closeStream(Object.keys(toolCalls).length > 0 ? 'tool_use' : 'end_turn');
             return;
           }
 
@@ -282,35 +355,24 @@ async function handleStream(response, model) {
           const finish = choice.finish_reason;
 
           if (delta.reasoning_content) {
-            if (!hasThinkingBlock) {
-              await send('content_block_start', { type: 'content_block_start', index: contentIndex, content_block: { type: 'thinking', thinking: '' } });
-              hasThinkingBlock = true;
-            }
-            await send('content_block_delta', { type: 'content_block_delta', index: contentIndex, delta: { type: 'thinking_delta', thinking: delta.reasoning_content } });
+            sendThinking(delta.reasoning_content);
           }
 
           if (delta.content) {
-            if (hasThinkingBlock && !hasTextBlock) {
-              await send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
-              hasThinkingBlock = false;
-            }
-            if (!hasTextBlock) {
-              await send('content_block_start', { type: 'content_block_start', index: contentIndex, content_block: { type: 'text', text: '' } });
-              hasTextBlock = true;
-            }
-            await send('content_block_delta', { type: 'content_block_delta', index: contentIndex, delta: { type: 'text_delta', text: delta.content } });
+            processContent(delta.content);
           }
 
           if (delta.tool_calls) {
+            flushBuffer();
             for (const tc of delta.tool_calls) {
               const idx = tc.index;
               if (!toolCalls[idx]) {
                 if (hasTextBlock) {
-                  await send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
+                  send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
                   hasTextBlock = false;
                 }
                 toolCalls[idx] = { id: tc.id, name: tc.function?.name, arguments: '' };
-                await send('content_block_start', {
+                send('content_block_start', {
                   type: 'content_block_start',
                   index: contentIndex + idx,
                   content_block: { type: 'tool_use', id: tc.id, name: tc.function?.name, input: {} },
@@ -319,7 +381,7 @@ async function handleStream(response, model) {
               if (tc.function?.name) toolCalls[idx].name = tc.function.name;
               if (tc.function?.arguments) {
                 toolCalls[idx].arguments += tc.function.arguments;
-                await send('content_block_delta', {
+                send('content_block_delta', {
                   type: 'content_block_delta',
                   index: contentIndex + idx,
                   delta: { type: 'input_json_delta', partial_json: tc.function.arguments },
@@ -332,7 +394,7 @@ async function handleStream(response, model) {
             let reason = 'end_turn';
             if (finish === 'length') reason = 'max_tokens';
             if (finish === 'tool_calls' || Object.keys(toolCalls).length > 0) reason = 'tool_use';
-            await closeStream(reason);
+            closeStream(reason);
             return;
           }
 
