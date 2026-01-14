@@ -1,5 +1,5 @@
 name = "nvidia-anthropic-proxy"
-main = "src/index.js"
+main = "index.js"
 compatibility_date = "2024-01-01"
 
 # 在 Cloudflare Dashboard 中配置以下 secrets:
