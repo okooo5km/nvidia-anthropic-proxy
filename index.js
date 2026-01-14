@@ -1,17 +1,5 @@
 const API_BASE = 'https://integrate.api.nvidia.com/v1';
 
-const MODEL_PREFIX_MAP = [
-  ['claude-opus-4', 'minimaxai/minimax-m2.1'],
-  ['claude-sonnet-4', 'z-ai/glm4.7'],
-];
-
-function mapModel(model) {
-  for (const [prefix, target] of MODEL_PREFIX_MAP) {
-    if (model.startsWith(prefix)) return target;
-  }
-  return model;
-}
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -55,13 +43,7 @@ function json(data, status = 200) {
 }
 
 function handleModels() {
-  const models = MODEL_PREFIX_MAP.map(([prefix]) => ({
-    id: prefix,
-    type: 'model',
-    display_name: prefix,
-    created_at: '2024-01-01T00:00:00Z',
-  }));
-  return json({ data: models, has_more: false, first_id: models[0].id, last_id: models.at(-1).id });
+  return json({ data: [], has_more: false, first_id: null, last_id: null });
 }
 
 async function handleMessages(request, env) {
@@ -71,8 +53,6 @@ async function handleMessages(request, env) {
       return json({ error: { type: 'invalid_request_error', message: 'model is required' } }, 400);
     }
 
-    const nvidiaModel = mapModel(body.model);
-
     const messages = [];
     if (body.system) messages.push({ role: 'system', content: body.system });
     for (const msg of body.messages) {
@@ -80,7 +60,7 @@ async function handleMessages(request, env) {
     }
 
     const payload = {
-      model: nvidiaModel,
+      model: body.model,
       messages,
       max_tokens: body.max_tokens,
       stream: !!body.stream,
@@ -137,42 +117,41 @@ function handleStream(response, model) {
   const enc = new TextEncoder();
   let tokens = 0;
 
-  const send = (ctrl, event, data) => ctrl.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  const readable = new ReadableStream({
+    async start(ctrl) {
+      const send = (event, data) => ctrl.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
 
-  const stream = new TransformStream({
-    start(ctrl) {
-      send(ctrl, 'message_start', {
+      send('message_start', {
         type: 'message_start',
         message: { id, type: 'message', role: 'assistant', content: [], model, stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } },
       });
-      send(ctrl, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-    },
-    transform(chunk, ctrl) {
-      for (const line of new TextDecoder().decode(chunk).split('\n')) {
-        if (!line.startsWith('data: ')) continue;
-        const raw = line.slice(6).trim();
-        if (raw === '[DONE]') continue;
+      send('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+
+      const es = EventSource.from(response.body);
+      es.onmessage = (e) => {
+        if (e.data === '[DONE]') return;
         try {
-          const parsed = JSON.parse(raw);
+          const parsed = JSON.parse(e.data);
           const delta = parsed.choices?.[0]?.delta;
           const finish = parsed.choices?.[0]?.finish_reason;
 
           if (delta?.content) {
-            send(ctrl, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta.content } });
+            send('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta.content } });
           }
           if (finish) {
-            send(ctrl, 'content_block_stop', { type: 'content_block_stop', index: 0 });
-            send(ctrl, 'message_delta', { type: 'message_delta', delta: { stop_reason: finish === 'length' ? 'max_tokens' : 'end_turn' }, usage: { output_tokens: tokens } });
-            send(ctrl, 'message_stop', { type: 'message_stop' });
+            send('content_block_stop', { type: 'content_block_stop', index: 0 });
+            send('message_delta', { type: 'message_delta', delta: { stop_reason: finish === 'length' ? 'max_tokens' : 'end_turn' }, usage: { output_tokens: tokens } });
+            send('message_stop', { type: 'message_stop' });
+            ctrl.close();
           }
           if (parsed.usage) tokens = parsed.usage.completion_tokens || 0;
         } catch {}
-      }
+      };
+      es.onerror = () => ctrl.close();
     },
   });
 
-  response.body.pipeTo(stream.writable);
-  return new Response(stream.readable, {
+  return new Response(readable, {
     headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' },
   });
 }
