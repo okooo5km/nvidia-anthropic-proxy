@@ -54,7 +54,6 @@ async function handleMessages(request, env) {
     }
 
     const messages = [];
-    // Handle system prompt (can be string or array of TextBlocks)
     if (body.system) {
       const systemContent = typeof body.system === 'string'
         ? body.system
@@ -90,6 +89,17 @@ async function handleMessages(request, env) {
           parameters: tool.input_schema || { type: 'object', properties: {} },
         },
       }));
+
+      // Convert tool_choice
+      if (body.tool_choice) {
+        if (body.tool_choice.type === 'auto') {
+          payload.tool_choice = 'auto';
+        } else if (body.tool_choice.type === 'any') {
+          payload.tool_choice = 'required';
+        } else if (body.tool_choice.type === 'tool') {
+          payload.tool_choice = { type: 'function', function: { name: body.tool_choice.name } };
+        }
+      }
     }
 
     const res = await fetch(`${API_BASE}/chat/completions`, {
@@ -124,11 +134,17 @@ async function handleMessages(request, env) {
     // Convert OpenAI tool_calls to Anthropic tool_use
     if (message?.tool_calls?.length) {
       for (const tc of message.tool_calls) {
+        let input = {};
+        try {
+          input = JSON.parse(tc.function.arguments || '{}');
+        } catch {
+          input = {};
+        }
         content.push({
           type: 'tool_use',
           id: tc.id,
           name: tc.function.name,
-          input: JSON.parse(tc.function.arguments || '{}'),
+          input,
         });
       }
     }
@@ -161,7 +177,6 @@ async function handleMessages(request, env) {
 function convertMessage(msg) {
   const content = msg.content;
 
-  // Simple string content
   if (typeof content === 'string') {
     return { role: msg.role, content };
   }
@@ -185,7 +200,6 @@ function convertMessage(msg) {
         },
       });
     } else if (block.type === 'tool_result') {
-      // User's tool result
       let resultContent = '';
       if (typeof block.content === 'string') {
         resultContent = block.content;
@@ -243,9 +257,39 @@ function handleStream(response, model) {
         message: { id, type: 'message', role: 'assistant', content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } },
       });
 
+      const closeStream = (reason = 'end_turn') => {
+        if (hasThinkingBlock) {
+          send('content_block_stop', { type: 'content_block_stop', index: contentIndex });
+          contentIndex++;
+        }
+        if (hasTextBlock) {
+          send('content_block_stop', { type: 'content_block_stop', index: contentIndex });
+          contentIndex++;
+        }
+        for (const idx of Object.keys(toolCalls)) {
+          send('content_block_stop', { type: 'content_block_stop', index: contentIndex + parseInt(idx) });
+        }
+        send('message_delta', { type: 'message_delta', delta: { stop_reason: reason }, usage: { output_tokens: tokens } });
+        send('message_stop', { type: 'message_stop' });
+        ctrl.close();
+      };
+
+      let streamEnded = false;
       const es = EventSource.from(response.body);
+
       es.onmessage = (e) => {
-        if (e.data === '[DONE]') return;
+        if (streamEnded) return;
+
+        // Handle [DONE] signal
+        if (e.data === '[DONE]') {
+          if (!streamEnded) {
+            streamEnded = true;
+            const reason = Object.keys(toolCalls).length > 0 ? 'tool_use' : 'end_turn';
+            closeStream(reason);
+          }
+          return;
+        }
+
         try {
           const parsed = JSON.parse(e.data);
           const delta = parsed.choices?.[0]?.delta;
@@ -306,33 +350,27 @@ function handleStream(response, model) {
             }
           }
 
-          if (finish) {
-            // Close any open blocks
-            if (hasThinkingBlock) {
-              send('content_block_stop', { type: 'content_block_stop', index: contentIndex });
-              contentIndex++;
-            }
-            if (hasTextBlock) {
-              send('content_block_stop', { type: 'content_block_stop', index: contentIndex });
-              contentIndex++;
-            }
-            for (const idx of Object.keys(toolCalls)) {
-              send('content_block_stop', { type: 'content_block_stop', index: contentIndex + parseInt(idx) });
-            }
-
-            // Determine stop reason
+          // Handle finish_reason before [DONE]
+          if (finish && !streamEnded) {
+            streamEnded = true;
             let stop_reason = 'end_turn';
             if (finish === 'length') stop_reason = 'max_tokens';
             if (finish === 'tool_calls' || Object.keys(toolCalls).length > 0) stop_reason = 'tool_use';
-
-            send('message_delta', { type: 'message_delta', delta: { stop_reason }, usage: { output_tokens: tokens } });
-            send('message_stop', { type: 'message_stop' });
-            ctrl.close();
+            closeStream(stop_reason);
           }
+
           if (parsed.usage) tokens = parsed.usage.completion_tokens || 0;
-        } catch {}
+        } catch (err) {
+          console.error('Stream parse error:', err.message);
+        }
       };
-      es.onerror = () => ctrl.close();
+
+      es.onerror = () => {
+        if (!streamEnded) {
+          streamEnded = true;
+          closeStream('end_turn');
+        }
+      };
     },
   });
 
