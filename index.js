@@ -229,106 +229,122 @@ async function handleStream(response, model) {
   const send = (event, data) => writer.write(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
 
   const closeStream = async (reason = 'end_turn') => {
-    if (hasThinkingBlock) send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
-    if (hasTextBlock) send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
+    if (hasThinkingBlock) await send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
+    if (hasTextBlock) await send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
     for (const idx of Object.keys(toolCalls)) {
-      send('content_block_stop', { type: 'content_block_stop', index: contentIndex + parseInt(idx) });
+      await send('content_block_stop', { type: 'content_block_stop', index: contentIndex + parseInt(idx) });
     }
-    send('message_delta', { type: 'message_delta', delta: { stop_reason: reason }, usage: { output_tokens: tokens } });
-    send('message_stop', { type: 'message_stop' });
+    await send('message_delta', { type: 'message_delta', delta: { stop_reason: reason }, usage: { output_tokens: tokens } });
+    await send('message_stop', { type: 'message_stop' });
     await writer.close();
   };
 
-  send('message_start', {
+  await send('message_start', {
     type: 'message_start',
     message: { id, type: 'message', role: 'assistant', content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } },
   });
 
   (async () => {
-    const reader = response.body.getReader();
-    let buffer = '';
+    try {
+      const reader = response.body.getReader();
+      let buffer = '';
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      buffer += dec.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
+        buffer += dec.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
 
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6);
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (!data) continue;
 
-        if (data === '[DONE]') {
-          await closeStream(Object.keys(toolCalls).length > 0 ? 'tool_use' : 'end_turn');
-          return;
-        }
-
-        const parsed = JSON.parse(data);
-        const delta = parsed.choices[0].delta;
-        const finish = parsed.choices[0].finish_reason;
-
-        if (delta.reasoning_content) {
-          if (!hasThinkingBlock) {
-            send('content_block_start', { type: 'content_block_start', index: contentIndex, content_block: { type: 'thinking', thinking: '' } });
-            hasThinkingBlock = true;
+          if (data === '[DONE]') {
+            await closeStream(Object.keys(toolCalls).length > 0 ? 'tool_use' : 'end_turn');
+            return;
           }
-          send('content_block_delta', { type: 'content_block_delta', index: contentIndex, delta: { type: 'thinking_delta', thinking: delta.reasoning_content } });
-        }
 
-        if (delta.content) {
-          if (hasThinkingBlock && !hasTextBlock) {
-            send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
-            hasThinkingBlock = false;
+          let parsed;
+          try {
+            parsed = JSON.parse(data);
+          } catch (e) {
+            console.error('JSON parse error:', data);
+            continue;
           }
-          if (!hasTextBlock) {
-            send('content_block_start', { type: 'content_block_start', index: contentIndex, content_block: { type: 'text', text: '' } });
-            hasTextBlock = true;
-          }
-          send('content_block_delta', { type: 'content_block_delta', index: contentIndex, delta: { type: 'text_delta', text: delta.content } });
-        }
 
-        if (delta.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            const idx = tc.index;
-            if (!toolCalls[idx]) {
-              if (hasTextBlock) {
-                send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
-                hasTextBlock = false;
+          const choice = parsed.choices?.[0];
+          if (!choice) continue;
+
+          const delta = choice.delta || {};
+          const finish = choice.finish_reason;
+
+          if (delta.reasoning_content) {
+            if (!hasThinkingBlock) {
+              await send('content_block_start', { type: 'content_block_start', index: contentIndex, content_block: { type: 'thinking', thinking: '' } });
+              hasThinkingBlock = true;
+            }
+            await send('content_block_delta', { type: 'content_block_delta', index: contentIndex, delta: { type: 'thinking_delta', thinking: delta.reasoning_content } });
+          }
+
+          if (delta.content) {
+            if (hasThinkingBlock && !hasTextBlock) {
+              await send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
+              hasThinkingBlock = false;
+            }
+            if (!hasTextBlock) {
+              await send('content_block_start', { type: 'content_block_start', index: contentIndex, content_block: { type: 'text', text: '' } });
+              hasTextBlock = true;
+            }
+            await send('content_block_delta', { type: 'content_block_delta', index: contentIndex, delta: { type: 'text_delta', text: delta.content } });
+          }
+
+          if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const idx = tc.index;
+              if (!toolCalls[idx]) {
+                if (hasTextBlock) {
+                  await send('content_block_stop', { type: 'content_block_stop', index: contentIndex++ });
+                  hasTextBlock = false;
+                }
+                toolCalls[idx] = { id: tc.id, name: tc.function?.name, arguments: '' };
+                await send('content_block_start', {
+                  type: 'content_block_start',
+                  index: contentIndex + idx,
+                  content_block: { type: 'tool_use', id: tc.id, name: tc.function?.name, input: {} },
+                });
               }
-              toolCalls[idx] = { id: tc.id, name: tc.function?.name, arguments: '' };
-              send('content_block_start', {
-                type: 'content_block_start',
-                index: contentIndex + idx,
-                content_block: { type: 'tool_use', id: tc.id, name: tc.function?.name, input: {} },
-              });
-            }
-            if (tc.function?.name) toolCalls[idx].name = tc.function.name;
-            if (tc.function?.arguments) {
-              toolCalls[idx].arguments += tc.function.arguments;
-              send('content_block_delta', {
-                type: 'content_block_delta',
-                index: contentIndex + idx,
-                delta: { type: 'input_json_delta', partial_json: tc.function.arguments },
-              });
+              if (tc.function?.name) toolCalls[idx].name = tc.function.name;
+              if (tc.function?.arguments) {
+                toolCalls[idx].arguments += tc.function.arguments;
+                await send('content_block_delta', {
+                  type: 'content_block_delta',
+                  index: contentIndex + idx,
+                  delta: { type: 'input_json_delta', partial_json: tc.function.arguments },
+                });
+              }
             }
           }
-        }
 
-        if (finish) {
-          let reason = 'end_turn';
-          if (finish === 'length') reason = 'max_tokens';
-          if (finish === 'tool_calls' || Object.keys(toolCalls).length > 0) reason = 'tool_use';
-          await closeStream(reason);
-          return;
-        }
+          if (finish) {
+            let reason = 'end_turn';
+            if (finish === 'length') reason = 'max_tokens';
+            if (finish === 'tool_calls' || Object.keys(toolCalls).length > 0) reason = 'tool_use';
+            await closeStream(reason);
+            return;
+          }
 
-        if (parsed.usage) tokens = parsed.usage.completion_tokens;
+          if (parsed.usage) tokens = parsed.usage.completion_tokens;
+        }
       }
-    }
 
-    await closeStream('end_turn');
+      await closeStream('end_turn');
+    } catch (err) {
+      console.error('Stream processing error:', err);
+      writer.close();
+    }
   })();
 
   return new Response(readable, {
