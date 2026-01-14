@@ -1,0 +1,7 @@
+name = "nvidia-anthropic-proxy"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# 在 Cloudflare Dashboard 中配置以下 secrets:
+# NVIDIA_API_KEY - 你的 Nvidia API 密钥
+# AUTH_TOKEN - 可选的认证 token，用于保护你的 proxy
