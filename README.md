@@ -4,11 +4,11 @@
 
 A Cloudflare Worker proxy that enables Claude Code to use NVIDIA NIM API models.
 
-## Features
-
 - Use NVIDIA NIM open-source models (Llama, Minimax, GLM, etc.) in Claude Code
 - Seamless model switching with full Claude Code experience
 - Low-latency access via Cloudflare's global edge network
+
+![Demo](public/demo.webp)
 
 ## Quick Start
 

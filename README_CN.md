@@ -4,11 +4,11 @@
 
 Cloudflare Worker 代理，让 Claude Code 使用 NVIDIA NIM API 的模型。
 
-## 特性
-
 - 在 Claude Code 中使用 NVIDIA NIM 的开源模型（Llama、Minimax、GLM 等）
 - 保持 Claude Code 完整体验，无缝切换模型
 - 利用 Cloudflare 全球边缘网络，低延迟访问
+
+![Demo](public/demo.webp)
 
 ## 快速开始
 
